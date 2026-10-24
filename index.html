@@ -924,13 +924,47 @@ async function sbCheck(){
 }
 
 // ── 저장 (localStorage + Supabase 동시)
+// 클라우드 저장에 실패한 키는 am_pendingSync에 기록해 두고, 다음 동기화 때 다시 올린다.
+// (대기 중인 키는 클라우드 데이터로 덮어쓰지 않는다 — 오프라인 수정분 보호)
+function sbPendingGet(){
+  try { return JSON.parse(localStorage.getItem('am_pendingSync')||'[]'); } catch(e){ return []; }
+}
+function sbPendingSet(arr){
+  try { localStorage.setItem('am_pendingSync', JSON.stringify(arr)); } catch(e){}
+}
+function sbPendingMark(key, on){
+  const set = new Set(sbPendingGet());
+  on ? set.add(key) : set.delete(key);
+  sbPendingSet([...set]);
+}
+async function sbUpsert(key, data){
+  const { error } = await sb.from('studio_data')
+    .upsert({ studio_id: sbStudioId, data_key: key, data_value: data },
+             { onConflict: 'studio_id,data_key' });
+  if(error){
+    console.warn('[SB] 저장 실패:', key, error.message);
+    sbPendingMark(key, true);
+    showSyncBadge('⚠️ 클라우드 저장 실패 — 다음 동기화 때 재시도');
+    return false;
+  }
+  sbPendingMark(key, false);
+  return true;
+}
 function lsSave(key, data){
   try { localStorage.setItem(key, JSON.stringify(data)); } catch(e){}
   if(sb && sbOnline && sbStudioId){
-    sb.from('studio_data')
-      .upsert({ studio_id: sbStudioId, data_key: key, data_value: data },
-               { onConflict: 'studio_id,data_key' })
-      .then(({error})=>{ if(error) console.warn('[SB] 저장 실패:',key,error.message); });
+    sbUpsert(key, data);
+  }
+  // 미로그인 상태의 로컬 데이터(예시 데이터 포함)는 대기 목록에 넣지 않는다:
+  // 새 기기에서 로그인할 때 클라우드 데이터를 덮어쓰면 안 되기 때문
+}
+// 대기 중인 키를 다시 클라우드에 올린다
+async function sbFlushPending(){
+  if(!sb || !sbOnline || !sbStudioId) return;
+  for(const key of sbPendingGet()){
+    const v = lsLoad(key);
+    if(v !== null) await sbUpsert(key, v);
+    else sbPendingMark(key, false);
   }
 }
 
@@ -951,7 +985,9 @@ async function sbLoadAll(){
       .eq('studio_id', sbStudioId);
     if(error) throw error;
     if(!data || !data.length) return false;
+    const pending = new Set(sbPendingGet());
     data.forEach(row => {
+      if(pending.has(row.data_key)) return; // 아직 올리지 못한 로컬 수정분은 보존
       try { localStorage.setItem(row.data_key, JSON.stringify(row.data_value)); } catch(e){}
     });
     console.log('[SB] 동기화 완료 —', data.length, '개 항목');
@@ -967,6 +1003,7 @@ async function sbSyncNow(showIndicator=false){
   if(!sbOnline || !sbStudioId || sbSyncing) return;
   sbSyncing = true;
   if(showIndicator) showSyncBadge('🔄 동기화 중...');
+  await sbFlushPending();
   const synced = await sbLoadAll();
   if(synced){
     applyLoadedData();
@@ -1066,6 +1103,7 @@ async function loadAll(){
   // Supabase 세션 확인 & 클라우드 동기화
   const online = await sbCheck();
   if(online){
+    await sbFlushPending();
     const synced = await sbLoadAll();
     if(synced) console.log('[SB] 클라우드 데이터 우선 적용');
   }
@@ -1677,8 +1715,9 @@ async function sbEmailLogin(email, password){
     sbOnline = true;
     console.log('[SB] 이메일 로그인 성공:', sbStudioId);
     // 클라우드에서 최신 데이터 로드
+    await sbFlushPending();
     const synced = await sbLoadAll();
-    if(synced) loadAll();
+    if(synced){ applyLoadedData(); if(role) render(); }
     return true;
   } catch(e) {
     console.warn('[SB] 로그인 실패:', e.message);
